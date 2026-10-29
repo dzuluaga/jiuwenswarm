@@ -13,6 +13,7 @@ import os
 import runpy
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
@@ -20,8 +21,9 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_sub
 block_cipher = None
 
 SPEC_DIR = os.path.abspath(globals().get("SPECPATH", os.getcwd()))
-project_root = os.path.abspath(os.path.join(SPEC_DIR, os.pardir))
-build_config_module = runpy.run_path(os.path.join(project_root, "scripts", "build_config.py"))
+packaging_root = os.path.abspath(os.environ.get("WORKSWARM_PACKAGING_ROOT", os.path.join(SPEC_DIR, os.pardir)))
+project_root = os.path.abspath(os.environ.get("WORKSWARM_SOURCE_ROOT", packaging_root))
+build_config_module = runpy.run_path(os.path.join(packaging_root, "scripts", "build_config.py"))
 build_config = build_config_module["load_build_config"](Path(project_root))
 runtime_config_path = Path(project_root, "jiuwenswarm", "common", "_build_config.py")
 expected_runtime_config = build_config_module["render_runtime_python"](build_config)
@@ -146,6 +148,19 @@ if not os.path.isdir(web_dist) or not os.listdir(web_dist):
 datas = webview_datas + [
     (os.path.join(project_root, "jiuwenswarm", "channels", "web", "frontend", "dist"), "jiuwenswarm/channels/web/frontend/dist"),
 ]
+# The backend artifact owns its ID, independently of source/release repository
+# layout. Repackaging this backend must preserve the embedded file unchanged.
+_identity_helper = runpy.run_path(os.path.join(project_root, "jiuwenswarm", "common", "worker_build_identity.py"))
+_identity_directory = tempfile.TemporaryDirectory(prefix="jiuwenswarm-build-identity-",
+    dir=os.environ.get("WORKSWARM_BUILD_ROOT") or None)
+_identity_file = Path(_identity_directory.name, _identity_helper["IDENTITY_FILENAME"])
+_identity_input = os.environ.get("WORKSWARM_WORKER_IDENTITY")
+_identity_helper["write_build_identity"](_identity_file, Path(project_root), packaging_root=Path(packaging_root),
+    identity_input=Path(_identity_input) if _identity_input else None)
+datas.append((str(_identity_file), "jiuwenswarm"))
+_build_metadata_file = Path(_identity_directory.name, "build-metadata.json")
+_identity_helper["write_build_metadata"](_build_metadata_file, build_config.version)
+datas.append((str(_build_metadata_file), "jiuwenswarm/resources"))
 _playwright_mcp_resource_dir = os.path.join(
     project_root,
     "jiuwenswarm",
@@ -230,6 +245,23 @@ for package_root in DISPATCH_PACKAGE_ROOTS:
 # openjiuwen 使用动态导入，需要收集全部子模块
 openjiuwen_submodules = collect_submodules("openjiuwen")
 symphony_submodules = collect_submodules("jiuwenswarm.symphony")
+# Gateway adapters are re-exported through package-level __getattr__ and
+# import_module(), so PyInstaller cannot discover them from the import graph.
+gateway_adapter_submodules = collect_submodules(
+    "jiuwenswarm.server.runtime.gateway_adapter"
+)
+# The Runtime Worker is launched by module name through the frozen entrypoint's
+# runpy dispatcher. PyInstaller cannot infer this subprocess entrypoint from
+# the string passed to ``-m``, so bundle the package and all of its modules.
+runtime_worker_submodules = collect_submodules(
+    "jiuwenswarm.server.worker"
+)
+# The CLI channel is launched the same way (``-m jiuwenswarm.channels.cli.main``).
+# PyInstaller cannot infer this entrypoint from the string passed to ``-m``,
+# so bundle the package and all of its modules as well.
+cli_channel_submodules = collect_submodules(
+    "jiuwenswarm.channels.cli"
+)
 # TeamManager imports this lifecycle hook while its parent package is being
 # initialized.  Keep it explicit because PyInstaller cannot reliably infer
 # this package-attribute import from the frozen entry point.
@@ -244,7 +276,17 @@ http2_submodules = [
 ]
 
 # 部分包需要显式声明隐藏导入
-hiddenimports = webview_hiddenimports + http2_submodules + [
+lazy_runtime_submodules = []
+for lazy_package in (
+    "jiuwenswarm.agents.harness.common.auto_harness",
+    "jiuwenswarm.agents.harness.common.tools",
+    "jiuwenswarm.agents.harness.common.rails",
+    "jiuwenswarm.common.auth",
+    "jiuwenswarm.agents.swarm",
+):
+    lazy_runtime_submodules += collect_submodules(lazy_package)
+
+hiddenimports = collect_submodules("jiuwenswarm.server.worker") + lazy_runtime_submodules + ["jiuwenswarm.server.supervisor.shutdown"] + webview_hiddenimports + http2_submodules + [
     "matplotlib",  # 论文 reporting 阶段生成结果图
     "pandas",  # pymilvus 依赖
     # ``--doctor`` imports these targets dynamically before business imports.
@@ -276,7 +318,7 @@ hiddenimports = webview_hiddenimports + http2_submodules + [
     "webview",
     "jiuwenswarm.channels.web.app_web",  # 静态文件服务
     "jiuwenswarm.channels.web.desktop_app",  # 桌面入口
-] + openjiuwen_submodules + symphony_submodules + team_kv_cache_hiddenimports + dispatch_submodules
+] + openjiuwen_submodules + symphony_submodules + gateway_adapter_submodules + runtime_worker_submodules + cli_channel_submodules + team_kv_cache_hiddenimports + dispatch_submodules
 
 # 排除不需要的模块以减小体积（pandas 为 pymilvus/openjiuwen 所需，不可排除）
 excludes = [
@@ -297,8 +339,8 @@ excludes = [
 ]
 
 # 入口脚本位于 scripts 目录
-entry_script = os.path.join(project_root, "scripts", "jiuwenswarm_exe_entry.py")
-mcp_entry_script = os.path.join(project_root, "scripts", "openjiuwen_team_mcp_exe_entry.py")
+entry_script = os.path.join(packaging_root, "scripts", "jiuwenswarm_exe_entry.py")
+mcp_entry_script = os.path.join(packaging_root, "scripts", "openjiuwen_team_mcp_exe_entry.py")
 
 # 图标路径（Windows 用 .ico，macOS 用 .icns）
 icon_path = os.path.join(
@@ -481,6 +523,20 @@ mcp_a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# A venv backed by Conda can have another Conda installation earlier on PATH.
+# Dependency discovery then finds an OpenSSL DLL without the symbols required
+# by the interpreter's _ssl.pyd. Keep the interpreter's own DLL pair together.
+if os.name == "nt":
+    _python_ssl_dir = Path(sys.base_prefix) / "Library" / "bin"
+    for _ssl_dll in ("libssl-3-x64.dll", "libcrypto-3-x64.dll"):
+        _ssl_source = _python_ssl_dir / _ssl_dll
+        if _ssl_source.is_file():
+            for _analysis in (a, mcp_a):
+                _analysis.binaries = [
+                    item for item in _analysis.binaries
+                    if os.path.normcase(item[0]) != os.path.normcase(_ssl_dll)
+                ] + [(_ssl_dll, str(_ssl_source), "BINARY")]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 mcp_pyz = PYZ(mcp_a.pure, mcp_a.zipped_data, cipher=block_cipher)

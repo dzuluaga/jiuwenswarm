@@ -53,6 +53,7 @@ import {
   rebuildRecord,
   unresolvedAttributesByRecordId,
   unresolvedHeadsOf,
+  withSequenceText,
 } from './trajectorySequences';
 import {
   exitTrajectoryReplay,
@@ -1441,9 +1442,15 @@ export const TrajectoryPanel = memo(function TrajectoryPanel({
     () => displayedRawRecords.find(record => detailRecordIdentity(record) === rawSelection),
     [displayedRawRecords, rawSelection],
   );
+  // The tree reads every value on each render, and a value stated by
+  // reference assembles its text on each read: show one copy with the text.
+  const rawRecordData = useMemo(
+    () => (rawRecord?.otlp == null ? undefined : withSequenceText(rawRecord.otlp)),
+    [rawRecord],
+  );
   const rawData = replayView === null
-    ? rawRecord?.otlp ?? (fetchedRaw?.identity === rawSelection ? fetchedRaw.data : undefined)
-    : rawRecord?.otlp ?? replayView.rawDataByRecordId.get(rawSelection);
+    ? rawRecordData ?? (fetchedRaw?.identity === rawSelection ? fetchedRaw.data : undefined)
+    : rawRecordData ?? replayView.rawDataByRecordId.get(rawSelection);
 
   const loadSelectedRaw = useCallback(async () => {
     if (replayArchive !== null) return;
@@ -1933,7 +1940,9 @@ export const TrajectoryPanel = memo(function TrajectoryPanel({
                       ? (range: TrajectoryTimeRange | null) => selectOnLaneRange(subjectId, range)
                       : ignoreTimelineRange,
                     spanSelectsRange: selecting,
-                    lockTimelineViewport: true,
+                    // Pan with a grab cursor after zoom, like the duration overview.
+                    // Selection mode locks the viewport so a left-drag paints the brush.
+                    lockTimelineViewport: selecting,
                     sharedViewport: timeAxis.viewport,
                     onSharedViewportChange: timeAxis.updateViewport,
                     sharedViewportRef: timeAxis.viewportRef,
